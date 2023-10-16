@@ -1,0 +1,569 @@
+#!/usr/bin/env python
+
+import argparse
+import math
+import random
+import sys
+
+from constants import *
+from Canvas import Canvas
+from Subsector import Subsector
+from System import System
+
+hex_centers = []
+
+def parse_arguments():
+    # TODO: Allow user to change default color parameters
+    parser = argparse.ArgumentParser(description='Render Traveller Maps')
+
+    parser.add_argument('-i', '--input')
+    parser.add_argument('-o', '--output')
+
+    parser.add_argument('-r', '--rotate', choices=[0, 90, 180, 270], default=0, type=int)
+
+    parser.add_argument('--no-hexes', action='store_true')
+    parser.add_argument('--no-trade-lanes', action='store_true')
+    parser.add_argument('--no-bases', action='store_true')
+    parser.add_argument('--no-zones', action='store_true')
+    parser.add_argument('--no-system-info', action='store_true')
+    parser.add_argument('--no-legends', action='store_true')
+    parser.add_argument('--no-color-shift', action='store_true')
+
+    parser.add_argument('--subsector-rows', default=1, type=int)
+    parser.add_argument('--subsector-cols', default=1, type=int)
+
+    args = parser.parse_args()
+
+    return args
+
+def read_systems_from_file(filepath):
+    systems = {}
+    with open(filepath, 'r') as fp:
+        lines = [ l.rstrip() for l in fp.readlines() ]
+        for line in lines:
+            if not line:
+                continue
+            system = System().parse(line)
+            systems[system.coords] = system
+
+    return systems
+
+def get_max_dimensions(coords):
+    max_x = max_y = 1
+    for coord in coords:
+        if (args.rotate // 90) % 2:
+            x = int(coord[2:])
+            y = int(coord[:2])
+        else:
+            x = int(coord[:2])
+            y = int(coord[2:])
+        max_x = max(max_x, x)
+        max_y = max(max_y, y)
+
+    max_x = get_ceiling_multiple(max_x, X_MULTIPLE)
+    max_y = get_ceiling_multiple(max_y, Y_MULTIPLE)
+
+    if (args.rotate // 90) % 2:
+        return max_y, max_x
+    else:
+        return max_x, max_y
+
+def get_xy_from_coords(coords, lower_bounds=None):
+    x = int(coords[:2])
+    y = int(coords[2:])
+
+    if lower_bounds:
+        x -= lower_bounds[0]
+        y -= lower_bounds[1]
+
+    if args.rotate == 0:
+        return x, y
+    elif args.rotate == 90:
+        return y, max_cols - x + 1
+    elif args.rotate == 180:
+        return max_cols - x + 1, max_rows - y + 1
+    elif args.rotate == 270:
+        return max_rows - y + 1, x
+    else:
+        raise RuntimeError(f'Invalid rotation: {args.rotate}')
+
+def get_ceiling_multiple(number, multiple):
+    return multiple * math.ceil(number / multiple)
+
+def get_min_dimensions(coords, upper_bounds):
+    min_x, min_y = upper_bounds
+    for coord in coords:
+        x, y = get_xy_from_coords(coord)
+        min_x = min(min_x, x)
+        min_y = min(min_y, y)
+
+    min_x = get_floor_multiple(min_x, X_MULTIPLE)
+    min_y = get_floor_multiple(min_y, Y_MULTIPLE)
+
+    if (args.rotate // 90) % 2:
+        return min_y, min_x
+    else:
+        return min_x, min_y
+
+def get_floor_multiple(number, multiple):
+    return multiple * math.floor(number / multiple)
+
+def draw_hex_layer(canvas, rows, cols):
+    for y in range(1, rows + 1):
+        for x in range(1, cols + 1):
+            origin = calculate_hex_center(x, y)
+            canvas.drawHex(origin, HEX_SIZE)
+
+def calculate_hex_center(x, y):
+    row = y - 1
+    col = x - 1
+    if hex_centers[row][col]:
+        return hex_centers[row][col]
+
+    col_center = (HEX_WIDTH * x * 3/4)
+    row_center = (HEX_HEIGHT * y) - HEX_HEIGHT // 4
+    if x % 2 == 0:
+        row_center += HEX_HEIGHT // 2
+
+    hex_centers[row][col] = (col_center, row_center)
+
+    return col_center, row_center
+
+def draw_trade_lanes_layer(canvas, systems, lower_bounds):
+    trade_lanes = calculateTradeLanes(systems)
+
+    for coords in systems.keys():
+        x, y = get_xy_from_coords(coords, lower_bounds)
+        origin = calculate_hex_center(x, y)
+
+        if coords in trade_lanes:
+            source = origin
+            for dest_coords in trade_lanes[coords]:
+                dest_x, dest_y = get_xy_from_coords(dest_coords, lower_bounds)
+                dest = calculate_hex_center(dest_x, dest_y)
+                canvas.drawLine([source, dest], fill=TRADE_LANE_COLOR,
+                                width=TRADE_LANE_THICKNESS)
+
+def calculateTradeLanes(systems):
+    trade_lanes = {}
+
+    def in_trade_bracket(system, codes):
+        for code in codes:
+            if code in system.trade_codes:
+                return True
+
+        return False
+
+    def is_valid_route(source, dest):
+        def is_not_interdicted(source, dest):
+            return systems[source].travel_code != 'R' and \
+                   systems[dest].travel_code != 'R'
+
+        def within_distance(coord1, coord2, limit):
+            x1, y1 = get_xy_from_coords(coord1)
+            x2, y2 = get_xy_from_coords(coord2)
+            distance = abs(x1 - x2) + abs(y1 - y2)
+
+            return distance <= limit
+
+        def within_trade_distance(coord1, coord2):
+            return within_distance(coord1, coord2, TRADE_DISTANCE_LIMIT)
+
+        def has_jump_route(source, dest):
+            def jump_route_helper(source, dest, limit):
+                if not limit:
+                    return False
+
+                def valid_route_point(dest):
+                    def has_fuel_facilities(dest):
+                        system = systems[dest]
+                        fuel_classes = ['A', 'B', 'C', 'D']
+
+                        return system.starport_class in fuel_classes or \
+                               'G' in system.bases
+
+                    return within_distance(source, dest, JUMP_2_ROUTE_LIMIT) and \
+                           has_fuel_facilities(dest)
+
+                jump_2_neighbors = [ c for c in systems.keys() if valid_route_point(c) ]
+
+                if dest in jump_2_neighbors:
+                    return True
+
+                for system in jump_2_neighbors:
+                    if jump_route_helper(system, dest, limit - 1):
+                        return True
+
+                return False
+
+            return jump_route_helper(source, dest, JUMP_2_ROUTE_LIMIT)
+
+        return is_not_interdicted(source, dest) and \
+               within_trade_distance(source, dest) and \
+               has_jump_route(source, dest)
+
+    brackets = [
+        (['In', 'Ht'], ['As', 'De', 'Ie', 'Ni']),
+        (['Hi', 'Ri'], ['Ag', 'Ga', 'Wa'])
+    ]
+
+    for bracket in brackets:
+        sources = [ c for c, s in systems.items() if in_trade_bracket(s, bracket[0]) ]
+        dests = [ c for c, s in systems.items() if in_trade_bracket(s, bracket[1]) ]
+
+        for source in sources:
+            if source not in trade_lanes:
+                trade_lanes[source] = set()
+            for dest in dests:
+                if is_valid_route(source, dest):
+                    trade_lanes[source].add(dest)
+
+    return trade_lanes
+
+def draw_system_layer(canvas, systems, lower_bounds):
+    for coords, system in systems.items():
+        x, y = get_xy_from_coords(coords, lower_bounds)
+        origin = calculate_hex_center(x, y)
+
+        if coords in systems:
+            draw_planet_icon(canvas, system, origin)
+
+            if system.bases:
+                if not args.no_bases:
+                    draw_bases(canvas, system, origin)
+            if system.travel_code:
+                if not args.no_zones:
+                    draw_zone_rings(canvas, system, origin)
+
+def draw_planet_icon(canvas, system, origin):
+    col_center, row_center = origin
+
+    def get_modified_colors():
+        dry_color = list(PLANET_COLOR_DRY)
+        wet_color = list(PLANET_COLOR_WET)
+
+        if not args.no_color_shift:
+            index = random.randint(0, 2)
+            dry_color[index] += random.randint(-COLOR_SHIFT_RANGE, COLOR_SHIFT_RANGE)
+
+            index = random.randint(0, 2)
+            wet_color[index] += random.randint(-COLOR_SHIFT_RANGE, COLOR_SHIFT_RANGE)
+
+        dry_color = tuple(dry_color)
+        wet_color = tuple(wet_color)
+
+        return dry_color, wet_color
+
+    dry_color, wet_color = get_modified_colors()
+
+    # If size is 0, draw asteroids instead of planet
+    # TODO: Improve asteroid algorithm so they are more distributed
+    if system.size == 0:
+        for i in range(3):
+            for j in range(5):
+                rand_x = col_center + random.randint(-PLANET_SIZE, PLANET_SIZE)
+                rand_y = row_center + random.randint(-PLANET_SIZE, PLANET_SIZE)
+                canvas.drawCircle((rand_x, rand_y), PLANET_SIZE // (4 * random.randint(1, 2)),
+                                  fill=PLANET_COLOR_DRY)
+    elif system.hydrographics < 2:
+        canvas.drawCircle((col_center, row_center), PLANET_SIZE,
+                              fill=dry_color)
+    else:
+        canvas.drawCircle((col_center, row_center), PLANET_SIZE,
+                          fill=wet_color)
+
+def draw_bases(canvas, system, origin):
+    col_center, row_center = origin
+
+    # Pirate Base
+    if 'P' in system.bases:
+        point = (col_center + MIDPOINT * DIAGONAL_BASE_FACTOR, row_center + MIDPOINT * DIAGONAL_BASE_FACTOR)
+        canvas.drawPolestar(point, BASE_SIZE, fill=BASE_COLOR_ONE)
+    # Imperial Consulate
+    if 'C' in system.bases:
+        point = (col_center, row_center + MIDPOINT)
+        canvas.drawStarburst(point, BASE_SIZE, fill=BASE_COLOR_THREE)
+    # TAS Facility
+    if 'T' in system.bases:
+        point = (col_center - MIDPOINT * DIAGONAL_BASE_FACTOR, row_center - MIDPOINT * DIAGONAL_BASE_FACTOR)
+        canvas.drawStar(point, BASE_SIZE, fill=BASE_COLOR_ONE)
+    # Research Station
+    if 'R' in system.bases:
+        point = (col_center + MIDPOINT * CARDINAL_BASE_FACTOR, row_center)
+        canvas.drawSquare(point, BASE_SIZE // 2, fill=BASE_COLOR_TWO)
+    # Naval Base
+    if 'N' in system.bases:
+        point = (col_center - MIDPOINT * CARDINAL_BASE_FACTOR, row_center)
+        canvas.drawStar(point, BASE_SIZE, fill=BASE_COLOR_TWO)
+    # Scout Outpost
+    if 'S' in system.bases:
+        point = (col_center - MIDPOINT * DIAGONAL_BASE_FACTOR, row_center + MIDPOINT * DIAGONAL_BASE_FACTOR)
+        canvas.drawTriangle(point, BASE_SIZE, fill=BASE_COLOR_ONE)
+    # Gas Giant
+    if 'G' in system.bases:
+        point = (col_center + MIDPOINT * DIAGONAL_BASE_FACTOR, row_center - MIDPOINT * DIAGONAL_BASE_FACTOR)
+        canvas.drawCircle(point, BASE_SIZE // 2, fill=PLANET_COLOR_DRY)
+        canvas.drawEllipse(point, BASE_SIZE, fill=BASE_COLOR_ONE)
+
+def draw_zone_rings(canvas, system, origin):
+    if system.travel_code == 'A':
+        zone_color = AMBER_ZONE
+    elif system.travel_code == 'R':
+        zone_color = RED_ZONE
+
+    canvas.drawCircle(origin, ZONE_SIZE, outline=zone_color, width=ZONE_THICKNESS)
+
+def draw_info_layer(canvas, systems, lower_bounds, upper_bounds):
+    num_sub_cols = (upper_bounds[0] - lower_bounds[0]) // X_MULTIPLE
+    num_sub_rows = (upper_bounds[1] - lower_bounds[1]) // Y_MULTIPLE
+    num_max = max(num_sub_cols, num_sub_rows)
+    subsectors = []
+    for y in range(num_max):
+        row = []
+        for x in range(num_max):
+            row.append([])
+        subsectors.append(row)
+
+    for coords, system in systems.items():
+        x, y = get_xy_from_coords(coords, lower_bounds)
+        row = get_floor_multiple(x-1, X_MULTIPLE) // X_MULTIPLE
+        col = get_floor_multiple(y-1, Y_MULTIPLE) // Y_MULTIPLE
+        subsectors[row][col].append(system)
+
+    capital_hexes = determine_subsector_capitals(subsectors)
+
+    for coords, system in systems.items():
+        x, y = get_xy_from_coords(coords, lower_bounds)
+        origin = calculate_hex_center(x, y)
+
+        if coords in systems:
+            draw_name(canvas, system, origin, coords in capital_hexes)
+            draw_coords(canvas, system, origin)
+            draw_uwp(canvas, system, origin)
+            draw_starport_class(canvas, system, origin)
+
+def determine_subsector_capitals(subsectors):
+    def determine_capital(subsector):
+        if not subsector:
+            return None
+
+        valid_systems = [ s for s in subsector if s.travel_code != 'R' ]
+
+        def calculate_capital_score(system):
+            return system.starport_class_score + system.population_score + len(system.bases) * 2
+
+        pop_sort = sorted(valid_systems, key=lambda s: calculate_capital_score(s))
+        capital_hex = pop_sort[-1].coords
+
+        return capital_hex
+
+    capital_hexes = []
+    for row in subsectors:
+        for subsector in row:
+            capital = determine_capital(subsector)
+            capital_hexes.append(capital)
+
+    return capital_hexes
+
+def draw_name(canvas, system, origin, capital=False):
+    col_center, row_center = origin
+
+    if system.population >= 9:
+        name = system.name.upper()
+    else:
+        name = system.name
+
+    if capital:
+        text_color = (255, 0, 0)
+    else:
+        text_color = None
+
+    width, height = FONT_LARGE.getsize(name)
+    canvas.drawText((col_center, row_center + HEX_HEIGHT // 2 - height // 2 - FONT_PADDING - 1),
+                    name, font=FONT_LARGE, fill=text_color)
+
+def draw_coords(canvas, system, origin):
+    col_center, row_center = origin
+    width, height = FONT_SMALL.getsize(system.coords)
+    canvas.drawText((col_center, row_center - HEX_HEIGHT // 2 + height // 2 + FONT_PADDING + 1),
+                    system.coords)
+
+def draw_uwp(canvas, system, origin):
+    col_center, row_center = origin
+    width, height = FONT_TINY.getsize(system.uwp)
+    canvas.drawText((col_center,
+                     row_center - HEX_HEIGHT // 2 + FONT_SIZE_SMALL + height // 2 + FONT_PADDING),
+                    system.uwp, font=FONT_TINY)
+
+def draw_starport_class(canvas, system, origin):
+    col_center, row_center = origin
+    canvas.drawText((col_center, row_center - MIDPOINT),
+                    system.starport_class, font=FONT_LARGE)
+
+def draw_legends(canvas, directions):
+    draw_directions(canvas, directions)
+    draw_corners(canvas)
+    # TODO: Icons
+
+def draw_directions(canvas, directions):
+    edge_width = HEX_SIZE // 4 - FONT_PADDING
+    def get_inner_horizontal_points(p1, p2, height):
+        p1 = (p1[0] + edge_width // 2 - height // 2 + FONT_PADDING, p1[1])
+        p2 = (p2[0] - edge_width // 2 + height // 2 - FONT_PADDING, p2[1])
+
+        return p1, p2
+
+    def draw_inner_horizontal_line(p1, p2, height):
+        p1, p2 = get_inner_horizontal_points(p1, p2, height)
+        canvas.drawLine([p1, p2], fill=CANVAS_BG, width=height // 2)
+
+    def draw_left_line(point, dimensions):
+        width, height = dimensions
+        p1 = (edge_width // 2, point[1] - FONT_PADDING)
+        p2 = (point[0] - width // 2 - p1[0], p1[1])
+        canvas.drawLine([p1, p2], fill=PLANET_COLOR_DRY, width=height)
+        draw_inner_horizontal_line(p1, p2, height)
+
+    def draw_right_line(point, dimensions):
+        width, height = dimensions
+        p1 = (point[0] + width // 2 + edge_width // 2, point[1] - FONT_PADDING)
+        p2 = (canvas.width - edge_width + height // 2 - FONT_PADDING, p1[1])
+        canvas.drawLine([p1, p2], fill=PLANET_COLOR_DRY, width=height)
+        draw_inner_horizontal_line(p1, p2, height)
+
+    def draw_horizontal_direction(point, direction):
+        text_dimensions = FONT_LARGE.getsize(direction)
+        canvas.drawText(point, direction, font=FONT_LARGE, bg=False)
+
+        draw_left_line(point, text_dimensions)
+        draw_right_line(point, text_dimensions)
+
+    def get_inner_vertical_points(p1, p2, height):
+        p1 = (p1[0], p1[1] + edge_width // 2 - height // 2 + FONT_PADDING)
+        p2 = (p2[0], p2[1] - edge_width // 2 + height // 2 - FONT_PADDING)
+
+        return p1, p2
+
+    def draw_inner_vertical_line(p1, p2, height):
+        p1, p2 = get_inner_vertical_points(p1, p2, height)
+        canvas.drawLine([p1, p2], fill=CANVAS_BG, width=height // 2)
+
+    def draw_top_line(point, dimensions):
+        width, height = dimensions
+        p1 = (point[0] - FONT_PADDING, edge_width // 2)
+        p2 = (p1[0], point[1] - width // 2 - p1[1] * 4)
+        canvas.drawLine([p1, p2], fill=PLANET_COLOR_DRY, width=height)
+        draw_inner_vertical_line(p1, p2, height)
+
+    def draw_bottom_line(point, dimensions):
+        width, height = dimensions
+        p1 = (point[0] - FONT_PADDING, point[1] + width // 2 + edge_width * 2)
+        p2 = (p1[0], canvas.height - edge_width + height // 2 - FONT_PADDING)
+        canvas.drawLine([p1, p2], fill=PLANET_COLOR_DRY, width=height)
+        draw_inner_vertical_line(p1, p2, height)
+
+    def draw_vertical_direction(point, direction):
+        text_dimensions = FONT_LARGE.getsize(direction)
+        canvas.drawText(point, direction, font=FONT_LARGE, direction='ttb', bg=False)
+
+        draw_top_line(point, text_dimensions)
+        draw_bottom_line(point, text_dimensions)
+
+    top_point = (canvas.width // 2, edge_width)
+    draw_horizontal_direction(top_point, directions[0])
+
+    right_point = (canvas.width - edge_width, canvas.height // 2)
+    draw_vertical_direction(right_point, directions[1])
+
+    bottom_point = (canvas.width // 2, canvas.height - edge_width)
+    draw_horizontal_direction(bottom_point, directions[2])
+
+    left_point = (edge_width, canvas.height // 2)
+    draw_vertical_direction(left_point, directions[3])
+
+def draw_corners(canvas):
+    corners = [
+        (0, 0),
+        (canvas.width, 0),
+        (0, canvas.height),
+        (canvas.width, canvas.height),
+    ]
+
+    for corner in corners:
+        canvas.drawCircle(corner, HEX_SIZE // 2, fill=PLANET_COLOR_DRY)
+
+def main():
+    global args
+    args = parse_arguments()
+
+    def rotate(dirs, n):
+        for i in range(n):
+            dirs = dirs[1:] + dirs[:-1]
+
+        return dirs
+
+    orientation = args.rotate // 90
+    directions = rotate(DIRECTIONS, orientation)
+
+    global X_MULTIPLE, Y_MULTIPLE
+    if orientation % 2:
+        X_MULTIPLE = ROW_MULTIPLE
+        Y_MULTIPLE = COL_MULTIPLE
+    else:
+        X_MULTIPLE = COL_MULTIPLE
+        Y_MULTIPLE = ROW_MULTIPLE
+
+    if not args.input:
+        systems = {}
+        if orientation % 2:
+            X_SUBSECTORS = args.subsector_rows
+            Y_SUBSECTORS = args.subsector_cols
+        else:
+            X_SUBSECTORS = args.subsector_cols
+            Y_SUBSECTORS = args.subsector_rows
+        for i in range(X_SUBSECTORS):
+            for j in range(Y_SUBSECTORS):
+                subsector = Subsector(i * COL_MULTIPLE + 1, j * ROW_MULTIPLE + 1)
+                systems = systems | subsector.systems
+    else:
+        filepath = args.input
+        systems = read_systems_from_file(filepath)
+
+    global max_cols, max_rows
+    max_cols, max_rows = get_max_dimensions(systems.keys())
+    min_cols, min_rows = get_min_dimensions(systems.keys(), (max_cols, max_rows))
+    cols = max_cols - min_cols
+    rows = max_rows - min_rows
+
+    if orientation % 2:
+        vertical = cols
+        horizontal = rows
+    else:
+        vertical = rows
+        horizontal = cols
+    for y in range(vertical):
+        row = []
+        for x in range(horizontal):
+            row.append([])
+        hex_centers.append(row)
+
+    width = int((horizontal + 1) * HEX_WIDTH * 3/4)
+    height = int((vertical + 1) * HEX_HEIGHT)
+    canvas = Canvas(width, height, CANVAS_BG)
+    if not args.no_hexes:
+        draw_hex_layer(canvas, vertical, horizontal)
+    if not args.no_trade_lanes:
+        draw_trade_lanes_layer(canvas, systems, (min_cols, min_rows))
+    draw_system_layer(canvas, systems, (min_cols, min_rows))
+    if not args.no_system_info:
+        draw_info_layer(canvas, systems, (min_cols, min_rows), (max_cols, max_rows))
+    if not args.no_legends:
+        draw_legends(canvas, directions)
+
+    if args.output:
+        canvas.img.save(args.output)
+    else:
+        canvas.img.show()
+
+if __name__ == "__main__":
+    main()
